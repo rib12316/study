@@ -103,6 +103,29 @@ cu_seqlens_k: [0, 2048, 2148, 2198]   ← KV 按 seq_lens 拼接
 
 每个请求在自己的区间内做 causal attention，请求之间互不干扰。**这就是 chunked prefill 能和 decode 混合的底层秘密**——FlashAttention 的 varlen 天然支持变长混合。
 
+```
+准备阶段:
+  query_1d  形状 [2050, D]    ← A 的 2048 + B 的 1 + C 的 1 拼接
+  key_1d    形状 [2198, D]    ← A 的 2048 + B 的 100 + C 的 50 拼接
+  value_1d  形状 [2198, D]
+  
+  cu_seqlens_q = [0, 2048, 2049, 2050]   ← query 端路标
+  cu_seqlens_k = [0, 2048, 2148, 2198]   ← KV 端路标
+
+kernel 内部(对 i=0,1,2 三个请求分别处理):
+  i=0 (A):
+    Q = query_1d[0:2048],  K = key_1d[0:2048],  V = value_1d[0:2048]
+    算 attention,套下三角 causal → 输出 [2048, D]   ← 这是 prefill
+  i=1 (B):
+    Q = query_1d[2048:2049],  K = key_1d[2048:2148],  V = value_1d[2048:2148]
+    1 个 query 看 100 个 KV,无内部遮挡(1 行无需 causal) → 输出 [1, D]   ← 这是 decode
+  i=2 (C):
+    Q = query_1d[2049:2050],  K = key_1d[2148:2198],  V = value_1d[2148:2198]
+    1 个 query 看 50 个 KV → 输出 [1, D]
+```
+输出拼回:
+  out_1d 形状 [2050, D]   ← A 的 2048 + B 的 1 + C 的 1,顺序对应回各请求
+
 > 💡 旧版 vLLM（v0）曾用"prefill 和 decode 分开两个 kernel 调用"的方案（padding 浪费），v1 统一成一次 varlen 调用，效率更高。这是 v1 架构的重要改进之一。
 
 ### 3.3 causal mask 的处理
