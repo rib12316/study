@@ -183,7 +183,112 @@ vLLM 的 QLoRA 推理支持 base 是任意量化格式（通过 `quant_method.ap
 
 ---
 
-## 八、任务答卷区
+## 八、常见疑问（Q&A）
+
+> 这一节记录学习过程中的真实疑问与解答，澄清 QLoRA 训练/部署的核心痛点。
+
+### Q1：训练时 base 是怎么预先量化的？如果 base 本身就是量化模型呢？
+
+#### QLoRA 的"预先量化"是加载即量化（load-time），不是离线固化
+
+QLoRA 原论文（Dettmers 2023）的做法，base 模型**不是**提前存成 NF4 文件再加载，而是：
+
+1. **加载原始 fp16/bf16 base 权重**（从 HF 下载的原始 checkpoint）
+2. 加载时用 **`bitsandbytes` 库实时量化成 NF4**，存到 GPU 显存（4bit）
+3. 前向时**实时反量化 NF4 → bf16** 参与计算（fused 在线性层里，不显式生成完整 bf16 权重）
+4. base 权重 frozen（`requires_grad=False`），只有 LoRA 的 A/B 参与反向传播
+
+代码上：
+```python
+model = AutoModelForCausalLM.from_pretrained(
+    "...",
+    quantization_config=BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",              # 用 NF4
+        bnb_4bit_compute_dtype=torch.bfloat16,  # 反量化成 bf16 算
+        bnb_4bit_use_double_quant=True,         # double quantization
+    )
+)
+model = get_peft_model(model, lora_config)      # 加 LoRA
+```
+
+所以"预先量化"准确说法是 **"加载时量化"**——原始 fp16 权重，加载进 GPU 瞬间量化成 NF4 常驻，前向按需反量化。
+
+#### NF4 是什么（简要）
+
+NF4（NormalFloat 4-bit）针对 LLM 权重的正态分布优化：把 4bit 的 16 个量化点**按正态分布分位数放置**（而非均匀），让权重密集区量化误差更小。配合 **double quantization**（对 scale 再量化一次，省额外显存）。
+
+#### 如果 base 本身就是 AWQ/GPTQ 量化模型？
+
+**QLoRA 训练一般不拿离线量化 checkpoint，坚持用原始 fp16 + bitsandbytes 实时 NF4。** 原因：
+- AWQ/GPTQ 的反量化路径为**推理**优化（fused kernel，不可微），不一定支持反向传播
+- QLoRA 训练框架（bitsandbytes + peft）为 **fp16 base + 实时 NF4** 设计，和 AWQ/GPTQ 离线量化流程不直接兼容
+
+> 讲义"训练用 NF4，推理用 AWQ"准确含义：**训练阶段**用 bitsandbytes 实时 NF4；**部署阶段**为用 vLLM 高效 kernel，可能换成 AWQ/GPTQ。两阶段用不同量化方法，是两套独立流程。
+
+---
+
+### Q2：vLLM 推理时为什么要"重新量化"？会性能下降吗？（关键澄清）
+
+#### ⚠️ 重要澄清：vLLM 不会无脑"反量化→融合 LoRA→再量化"
+
+讲义第四节可能让人误解"vLLM 一定会重新量化成 AWQ"。**不准确**。QLoRA 训练完得到 **NF4 base + fp16 LoRA**，部署有**两条路径**：
+
+#### 路径A：保留 LoRA 分离（推荐，vLLM 原生支持）
+
+vLLM 直接加载"量化 base + 独立 LoRA"：
+- base 加载成某种量化格式（取决于 checkpoint）
+- LoRA 单独加载（第11讲热加载机制）
+- 前向：`y = base_quant.apply(x) + B@A@x`（本讲"量化对 LoRA 透明"）
+
+**这条路径不存在"反量化→融合→再量化"。** LoRA 永远是独立 fp16 小矩阵，叠加在 base 的 fp16 输出上。**训练-推理一致，无额外精度损失。**
+
+#### 路径B：合并 LoRA 进 base（merge）——有精度损失，谨慎用
+
+为简化部署（运行时只管一个文件），把 LoRA **合并**进 base：
+```
+W_merged = W_base + B @ A     （fp16 域算，得到完整 fp16 权重）
+```
+合并后得到 **fp16 完整模型**，若要量化部署再对这个 fp16 做 AWQ/GPTQ。
+
+**这条路径确实有"重新量化"，确实会性能下降**，损失来源：
+1. **量化方法不一致**：训练时 base 是 NF4，合并后重新 AWQ，两种量化误差分布不同
+2. **LoRA 被一起量化**：原本 fp16 的 LoRA（B@A）合并后也被压成 4bit，牺牲了 LoRA 精度优势
+3. **训练-推理不一致**：训练时模型"看到"NF4 base，推理变 AWQ base，权重数值有偏移
+
+#### 工程结论
+
+**优先路径A（分离部署）**，避免重新量化：
+- vLLM 直接加载"量化 base + 独立 LoRA"，不 merge 不重新量化
+- 训练-推理一致 ✓
+
+**路径B（merge 后重新量化）只在特定情况用**（部署框架不支持运行时 LoRA、想极致简化），此时确实接受精度损失，通常要重新校准（AWQ 校准集）缓解。
+
+> 你的担心是对的：路径B 的"重新量化"确实导致性能下降（训练 NF4 vs 推理 AWQ 不一致 + LoRA 被量化）。**所以工程上优先路径A，让 LoRA 保持 fp16 独立叠加，vLLM 的 LoRA 热加载就是为路径A 设计的。**
+
+---
+
+### 两问串联
+
+```
+训练阶段：
+  原始 fp16 base → bitsandbytes 实时量化成 NF4（Q1，加载即量化）
+  → 冻结 NF4 base，训 fp16 LoRA
+  → 得到 NF4 base + fp16 LoRA
+
+部署阶段（两条路径，Q2）：
+  路径A（推荐）：vLLM 直接加载"量化base + 独立LoRA"
+    → 前向 y = base_quant(x) + B@A@x（透明叠加）
+    → 不重新量化，训练-推理一致 ✓
+  
+  路径B（谨慎）：merge LoRA 进 base → fp16 完整模型 → 重新 AWQ 量化
+    → 有精度损失（LoRA 被量化、量化方法不一致、训练-推理不一致）✗
+    → 只在不得不用时用，需重新校准
+```
+
+---
+
+## 九、任务答卷区
 
 > 代码阅读 A/B/C 答案写这里。实践代码放 `practice_qlora.py`，跑通后贴输出。
 
@@ -201,7 +306,7 @@ vLLM 的 QLoRA 推理支持 base 是任意量化格式（通过 `quant_method.ap
 
 ---
 
-## 九、学习过程与实践总结（一起填）
+## 十、学习过程与实践总结（一起填）
 
 > 完成实践后写 3-5 句。示例方向：① 实践 2 里 err_qlora ≈ err_base，你对"LoRA 不放大 base 量化误差"的理解？② 实践 3 里 per-group vs per-tensor 误差差异多大？这解释了 NF4 group=64 的设计？③ 训练时的"LoRA 补偿量化误差"效应，你怎么理解（LoRA 学到的 A/B 部分抵消了 ε@x）？
 
